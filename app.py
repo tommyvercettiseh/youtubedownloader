@@ -1,5 +1,7 @@
+import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -13,6 +15,9 @@ import yt_dlp
 
 APP_TITLE = "YouTube Downloader"
 DEFAULT_OUTPUT = Path.home() / "Downloads" / "YouTube Downloads"
+LEGACY_COOKIE_DIR = Path.home() / "Videos" / "YouTubeDownloads" / "Cookies"
+COOKIE_JSON = LEGACY_COOKIE_DIR / "cookies.json"
+COOKIE_TXT = LEGACY_COOKIE_DIR / "cookies.txt"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -20,22 +25,31 @@ ctk.set_default_color_theme("blue")
 
 def safe_name(text: str) -> str:
     forbidden = '<>:"/\\|?*'
-    return ''.join('_' if c in forbidden else c for c in text).strip()
+    clean = ''.join('_' if c in forbidden else c for c in text).strip()
+    return clean[:140] or "video"
 
 
-class YTDLLogger:
-    def __init__(self, app):
-        self.app = app
-
-    def debug(self, msg):
-        if msg.startswith('[download]'):
-            self.app.events.put(("log", msg))
-
-    def warning(self, msg):
-        self.app.events.put(("log", f"Waarschuwing: {msg}"))
-
-    def error(self, msg):
-        self.app.events.put(("log", f"Fout: {msg}"))
+def convert_json_to_netscape(json_file: Path, output_file: Path) -> bool:
+    if not json_file.exists():
+        return False
+    try:
+        with json_file.open("r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with output_file.open("w", encoding="utf-8") as f:
+            f.write("# Netscape HTTP Cookie File\n\n")
+            for cookie in cookies:
+                domain = cookie.get("domain", "")
+                flag = "TRUE" if str(domain).startswith(".") else "FALSE"
+                path = cookie.get("path", "/")
+                secure = "TRUE" if cookie.get("secure") else "FALSE"
+                expiry = int(cookie.get("expirationDate", 0) or 0)
+                name = cookie.get("name", "")
+                value = cookie.get("value", "")
+                f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}\n")
+        return True
+    except Exception:
+        return False
 
 
 class App(ctk.CTk):
@@ -48,6 +62,7 @@ class App(ctk.CTk):
         self.events = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker = None
+        self.proc = None
         self.playlist_info = None
         self.current_entries = []
 
@@ -57,6 +72,9 @@ class App(ctk.CTk):
         self.status_var = tk.StringVar(value="Plak een YouTube-link om te beginnen")
         self.current_var = tk.StringVar(value="Nog geen download gestart")
         self.counter_var = tk.StringVar(value="0 / 0 voltooid")
+
+        if COOKIE_JSON.exists():
+            convert_json_to_netscape(COOKIE_JSON, COOKIE_TXT)
 
         self._build_ui()
         self.after(100, self._poll_events)
@@ -99,7 +117,7 @@ class App(ctk.CTk):
         info.grid(row=2, column=0, padx=24, pady=8, sticky="ew")
         info.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(info, textvariable=self.status_var, anchor="w", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=18, pady=(14, 4), sticky="ew")
-        ctk.CTkLabel(info, text="De app downloadt géén ondertiteling. Alleen een Nederlandse audiotrack wordt geaccepteerd.", anchor="w", text_color="#aeb7c2").grid(row=1, column=0, padx=18, pady=(0, 14), sticky="ew")
+        ctk.CTkLabel(info, text="Geen ondertiteling. De app zoekt per video naar de expliciete [nl] audiostream, zoals je oude werkende script.", anchor="w", text_color="#aeb7c2").grid(row=1, column=0, padx=18, pady=(0, 14), sticky="ew")
 
         actions = ctk.CTkFrame(main, fg_color="transparent")
         actions.grid(row=3, column=0, padx=24, pady=8, sticky="ew")
@@ -132,12 +150,8 @@ class App(ctk.CTk):
 
         cols = ("nr", "title", "audio", "status", "progress", "size")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=15)
-        self.tree.heading("nr", text="#")
-        self.tree.heading("title", text="Titel")
-        self.tree.heading("audio", text="Audio")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("progress", text="Voortgang")
-        self.tree.heading("size", text="Grootte")
+        for col, label in [("nr", "#"), ("title", "Titel"), ("audio", "Audio"), ("status", "Status"), ("progress", "Voortgang"), ("size", "Grootte")]:
+            self.tree.heading(col, text=label)
         self.tree.column("nr", width=45, anchor="center")
         self.tree.column("title", width=600)
         self.tree.column("audio", width=150)
@@ -170,6 +184,14 @@ class App(ctk.CTk):
         self.playlist_btn.configure(state=state)
         self.cancel_btn.configure(state="normal" if busy else "disabled")
 
+    def _cookie_args(self):
+        if COOKIE_JSON.exists() and not COOKIE_TXT.exists():
+            convert_json_to_netscape(COOKIE_JSON, COOKIE_TXT)
+        return ["--cookies", str(COOKIE_TXT)] if COOKIE_TXT.exists() else []
+
+    def _ydl_base_cmd(self):
+        return [sys.executable, "-m", "yt_dlp", *self._cookie_args()]
+
     def analyse(self):
         url = self.url_var.get().strip()
         if not url:
@@ -183,6 +205,8 @@ class App(ctk.CTk):
     def _analyse_worker(self, url):
         try:
             opts = {"quiet": True, "skip_download": True, "extract_flat": "in_playlist"}
+            if COOKIE_TXT.exists():
+                opts["cookiefile"] = str(COOKIE_TXT)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             self.events.put(("analysed", info))
@@ -192,69 +216,50 @@ class App(ctk.CTk):
     def _is_playlist(self, info):
         return info.get("_type") == "playlist" or bool(info.get("entries"))
 
-    def _audio_languages(self, info):
-        langs = []
-        for f in info.get("formats", []) or []:
-            if f.get("acodec") and f.get("acodec") != "none":
-                lang = (f.get("language") or "").strip()
-                if lang and lang not in langs:
-                    langs.append(lang)
-        return langs
+    def _find_dutch_audio_format(self, video_url):
+        """Zelfde bewezen methode als het oude script: yt-dlp -F en zoek [nl] + audio only."""
+        cmd = [*self._ydl_base_cmd(), "-F", video_url]
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
 
-    def _has_dutch_audio(self, info):
-        langs = self._audio_languages(info)
-        return any(lang.lower().startswith("nl") or "dutch" in lang.lower() for lang in langs)
+        candidates = []
+        for line in output.splitlines():
+            lower = line.lower()
+            is_audio = "audio only" in lower
+            is_dutch = bool(re.search(r"\[nl(?:[-_][a-z]+)?\]", line, re.IGNORECASE)) or "dutch" in lower or "nederlands" in lower
+            if is_audio and is_dutch:
+                match = re.match(r"\s*([^\s]+)", line)
+                if match:
+                    candidates.append((match.group(1), line.strip()))
 
-    def _format_selector(self):
+        if not candidates:
+            return None, output
+
+        # De eerste expliciete Nederlandse audio-only stream is exact hoe de oude versie werkte.
+        return candidates[0][0], candidates[0][1]
+
+    def _height_filter(self):
         q = self.quality_var.get()
-        height = "720" if q == "720p" else "1080" if q == "1080p" else None
-        vh = f"[height<={height}]" if height else ""
-        # Prioriteit: expliciete Nederlandse audiotrack. Geen Engelse fallback.
-        return f"bv*{vh}+ba[language^=nl]/b{vh}[language^=nl]"
+        if q == "720p":
+            return "[height<=720]"
+        if q == "1080p":
+            return "[height<=1080]"
+        return ""
 
-    def _download_opts(self, playlist: bool):
-        out = Path(self.output_var.get())
-        out.mkdir(parents=True, exist_ok=True)
-        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        template = str(out / ("%(playlist_index)02d - %(title)s.%(ext)s" if playlist else "%(title)s.%(ext)s"))
-        return {
-            "format": self._format_selector(),
-            "merge_output_format": "mp4",
-            "outtmpl": template,
-            "ffmpeg_location": ffmpeg,
-            "noplaylist": not playlist,
-            "ignoreerrors": False,
-            "continuedl": True,
-            "overwrites": False,
-            "writethumbnail": False,
-            "writesubtitles": False,
-            "writeautomaticsub": False,
-            "logger": YTDLLogger(self),
-            "progress_hooks": [self._progress_hook],
-            "quiet": True,
-        }
+    def _get_playlist_entries(self, url, first_only=False):
+        opts = {"quiet": True, "skip_download": True, "extract_flat": True}
+        if first_only:
+            opts["playlist_items"] = "1"
+        if COOKIE_TXT.exists():
+            opts["cookiefile"] = str(COOKIE_TXT)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-    def _progress_hook(self, d):
-        if self.cancel_event.is_set():
-            raise RuntimeError("Download gestopt door gebruiker")
-        status = d.get("status")
-        info = d.get("info_dict", {})
-        title = info.get("title", "Onbekende video")
-        index = info.get("playlist_index") or 1
-        total = info.get("playlist_count") or len(self.current_entries) or 1
-        downloaded = d.get("downloaded_bytes") or 0
-        total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        pct = (downloaded / total_bytes * 100) if total_bytes else 0
-        size = self._human_size(total_bytes) if total_bytes else ""
-        self.events.put(("progress", index, total, title, status, pct, size))
-
-    @staticmethod
-    def _human_size(n):
-        for unit in ["B", "KB", "MB", "GB"]:
-            if n < 1024:
-                return f"{n:.1f} {unit}"
-            n /= 1024
-        return f"{n:.1f} TB"
+        if info.get("entries"):
+            entries = [e for e in info.get("entries", []) if e]
+        else:
+            entries = [info]
+        return info, entries
 
     def download_test(self):
         url = self.url_var.get().strip()
@@ -274,53 +279,134 @@ class App(ctk.CTk):
         self.cancel_event.clear()
         self._set_busy(True)
         self.progress.set(0)
-        self.current_var.set("Nederlandse gesproken audio controleren…")
+        self.current_var.set("Nederlandse audiostream zoeken…")
         self.worker = threading.Thread(target=self._download_worker, args=(url, playlist, test_first), daemon=True)
         self.worker.start()
 
     def _download_worker(self, url, playlist, test_first):
         try:
-            # Bij een playlist is test = alleen eerste item.
-            probe_opts = {"quiet": True, "skip_download": True, "playlist_items": "1" if test_first else None}
-            with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                probe = ydl.extract_info(url, download=False)
+            _, entries = self._get_playlist_entries(url, first_only=test_first)
+            if not entries:
+                raise RuntimeError("Geen video's gevonden.")
 
-            candidate = probe
-            if probe.get("entries"):
-                entries = [e for e in probe.get("entries", []) if e]
-                if not entries:
-                    raise RuntimeError("Geen video's in de playlist gevonden.")
-                candidate = entries[0]
-                if not candidate.get("formats") and candidate.get("webpage_url"):
-                    with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
-                        candidate = ydl.extract_info(candidate["webpage_url"], download=False)
-
-            langs = self._audio_languages(candidate)
-            if not self._has_dutch_audio(candidate):
-                shown = ", ".join(langs) if langs else "geen taalmetadata"
-                raise RuntimeError(
-                    "Geen expliciete Nederlandse audiotrack gevonden voor de testvideo. "
-                    f"Gedetecteerd: {shown}. De app downloadt bewust geen andere taal."
-                )
-
-            actual_playlist = playlist and not test_first
-            opts = self._download_opts(actual_playlist)
             if test_first:
-                opts["playlist_items"] = "1"
-                opts["noplaylist"] = False
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
+                entries = entries[:1]
+
+            self.current_entries = entries
+            total = len(entries)
+            out_dir = Path(self.output_var.get())
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            for pos, entry in enumerate(entries, 1):
+                if self.cancel_event.is_set():
+                    raise RuntimeError("Download gestopt door gebruiker")
+
+                video_id = entry.get("id")
+                if not video_id:
+                    continue
+                video_url = entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+                title = entry.get("title") or f"Video {pos}"
+                filename = f"{pos:02d} - {safe_name(title)}.mp4" if (playlist and not test_first) else f"{safe_name(title)}.mp4"
+                output_path = out_dir / filename
+
+                if output_path.exists():
+                    self.events.put(("progress", pos, total, title, "finished", 100.0, self._human_size(output_path.stat().st_size), "Nederlands"))
+                    continue
+
+                self.events.put(("checking", pos, total, title))
+                audio_format, diagnostic = self._find_dutch_audio_format(video_url)
+                if not audio_format:
+                    preview = "\n".join([line for line in diagnostic.splitlines() if "audio only" in line.lower()][-10:])
+                    raise RuntimeError(
+                        f"Geen [nl] audio-only stream gevonden bij {pos:02d}. {title}.\n\n"
+                        f"Laatste audioformats:\n{preview or 'Geen audioformatregels gevonden.'}"
+                    )
+
+                self.events.put(("audio_found", pos, total, title, audio_format))
+                self._download_one(video_url, output_path, audio_format, pos, total, title)
+
             self.events.put(("done", "Testvideo gedownload" if test_first else "Playlist voltooid"))
         except Exception as exc:
             self.events.put(("error", str(exc)))
+        finally:
+            self.proc = None
+
+    def _download_one(self, video_url, output_path, audio_format, index, total, title):
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        selector = f"bv*{self._height_filter()}+{audio_format}"
+        cmd = [
+            *self._ydl_base_cmd(),
+            "--newline",
+            "--no-part",
+            "--force-keyframes-at-cuts",
+            "--add-header", "User-Agent: Mozilla/5.0",
+            "--fragment-retries", "15",
+            "--retries", "10",
+            "--sleep-interval", "2",
+            "--max-sleep-interval", "5",
+            "--ffmpeg-location", ffmpeg,
+            "--merge-output-format", "mp4",
+            "--no-write-subs",
+            "--no-write-auto-subs",
+            "-f", selector,
+            "-o", str(output_path),
+            video_url,
+        ]
+
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        last_pct = 0.0
+        size = ""
+        for line in self.proc.stdout:
+            if self.cancel_event.is_set():
+                self.proc.terminate()
+                raise RuntimeError("Download gestopt door gebruiker")
+
+            pct_match = re.search(r"\[download\]\s+([0-9.]+)%", line)
+            if pct_match:
+                last_pct = float(pct_match.group(1))
+            size_match = re.search(r"of\s+~?\s*([0-9.]+\s*[KMGTP]i?B)", line, re.IGNORECASE)
+            if size_match:
+                size = size_match.group(1)
+            self.events.put(("progress", index, total, title, "downloading", last_pct, size, f"NL · {audio_format}"))
+
+        rc = self.proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"yt-dlp stopte met foutcode {rc} bij {title}")
+
+        final_size = self._human_size(output_path.stat().st_size) if output_path.exists() else size
+        self.events.put(("progress", index, total, title, "finished", 100.0, final_size, f"NL · {audio_format}"))
+        self.proc = None
+
+    @staticmethod
+    def _human_size(n):
+        n = float(n)
+        for unit in ["B", "KB", "MB", "GB"]:
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} TB"
 
     def cancel_download(self):
         self.cancel_event.set()
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
         self.current_var.set("Download stoppen…")
 
-    def _upsert_row(self, index, title, status, pct, size):
+    def _upsert_row(self, index, title, audio, status, pct, size):
         iid = str(index)
-        values = (f"{int(index):02d}", title, "Nederlands", status, f"{pct:.0f}%", size)
+        values = (f"{int(index):02d}", title, audio, status, f"{pct:.0f}%", size)
         if self.tree.exists(iid):
             self.tree.item(iid, values=values)
         else:
@@ -331,6 +417,7 @@ class App(ctk.CTk):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
+
                 if kind == "analysed":
                     info = event[1]
                     self.playlist_info = info
@@ -340,28 +427,39 @@ class App(ctk.CTk):
                     else:
                         self.status_var.set(info.get("title", "Video gevonden"))
                     self._set_busy(False)
+
+                elif kind == "checking":
+                    _, idx, total, title = event
+                    self.current_var.set(f"{idx:02d}. NL audio controleren: {title}")
+                    self._upsert_row(idx, title, "Zoeken…", "Controleren", 0, "")
+                    self.counter_var.set(f"{idx - 1} / {total} voltooid")
+
+                elif kind == "audio_found":
+                    _, idx, total, title, audio_id = event
+                    self.current_var.set(f"{idx:02d}. Nederlandse audio gevonden ({audio_id}) · downloaden…")
+                    self._upsert_row(idx, title, f"NL · {audio_id}", "Gevonden", 0, "")
+
                 elif kind == "progress":
-                    _, idx, total, title, status, pct, size = event
+                    _, idx, total, title, status, pct, size, audio = event
                     label = "Voltooid" if status == "finished" else "Bezig"
-                    if status == "finished":
-                        pct = 100
-                    self._upsert_row(idx, title, label, pct, size)
+                    self._upsert_row(idx, title, audio, label, pct, size)
                     overall = ((idx - 1) + pct / 100) / max(total, 1)
                     self.progress.set(min(max(overall, 0), 1))
-                    self.current_var.set(f"{int(idx):02d}. {title}  •  {pct:.0f}%")
-                    completed = int(idx) if status == "finished" else max(int(idx) - 1, 0)
-                    self.counter_var.set(f"{completed} / {int(total)} voltooid")
+                    self.current_var.set(f"{idx:02d}. {title}  •  {pct:.0f}%")
+                    completed = idx if status == "finished" else max(idx - 1, 0)
+                    self.counter_var.set(f"{completed} / {total} voltooid")
+
                 elif kind == "done":
                     self.progress.set(1)
                     self.current_var.set(event[1])
-                    self.status_var.set("Klaar ✅  Open de uitvoermap en speel de testvideo af.")
+                    self.status_var.set("Klaar ✅ Open de uitvoermap en controleer de Nederlandse gesproken audio.")
                     self._set_busy(False)
+
                 elif kind == "error":
                     self._set_busy(False)
-                    self.status_var.set("Download niet gestart")
+                    self.status_var.set("Download niet voltooid")
                     messagebox.showerror("YouTube Downloader", event[1])
-                elif kind == "log":
-                    pass
+
         except queue.Empty:
             pass
         self.after(100, self._poll_events)
