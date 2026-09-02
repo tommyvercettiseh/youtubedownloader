@@ -63,7 +63,6 @@ class App(ctk.CTk):
         self.cancel_event = threading.Event()
         self.worker = None
         self.proc = None
-        self.playlist_info = None
         self.current_entries = []
 
         self.url_var = tk.StringVar()
@@ -105,7 +104,6 @@ class App(ctk.CTk):
         settings = ctk.CTkFrame(input_card, fg_color="transparent")
         settings.grid(row=2, column=0, columnspan=4, padx=18, pady=(0, 16), sticky="ew")
         settings.grid_columnconfigure(1, weight=1)
-
         ctk.CTkLabel(settings, text="Uitvoermap").grid(row=0, column=0, padx=(0, 10), sticky="w")
         ctk.CTkEntry(settings, textvariable=self.output_var, height=36).grid(row=0, column=1, sticky="ew")
         ctk.CTkButton(settings, text="Bladeren", width=100, command=self.choose_output).grid(row=0, column=2, padx=8)
@@ -117,7 +115,7 @@ class App(ctk.CTk):
         info.grid(row=2, column=0, padx=24, pady=8, sticky="ew")
         info.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(info, textvariable=self.status_var, anchor="w", font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, padx=18, pady=(14, 4), sticky="ew")
-        ctk.CTkLabel(info, text="Geen ondertiteling. De app zoekt per video naar de expliciete [nl] audiostream, zoals je oude werkende script.", anchor="w", text_color="#aeb7c2").grid(row=1, column=0, padx=18, pady=(0, 14), sticky="ew")
+        ctk.CTkLabel(info, text="Geen ondertiteling. Per video wordt gezocht naar een expliciete [nl] audiostream.", anchor="w", text_color="#aeb7c2").grid(row=1, column=0, padx=18, pady=(0, 14), sticky="ew")
 
         actions = ctk.CTkFrame(main, fg_color="transparent")
         actions.grid(row=3, column=0, padx=24, pady=8, sticky="ew")
@@ -189,8 +187,12 @@ class App(ctk.CTk):
             convert_json_to_netscape(COOKIE_JSON, COOKIE_TXT)
         return ["--cookies", str(COOKIE_TXT)] if COOKIE_TXT.exists() else []
 
-    def _ydl_base_cmd(self):
-        return [sys.executable, "-m", "yt_dlp", *self._cookie_args()]
+    def _base_cmd(self, use_cookies=False):
+        cmd = [sys.executable, "-m", "yt_dlp"]
+        if use_cookies:
+            cmd += self._cookie_args()
+            cmd += ["--extractor-args", "youtube:player_client=default,web_embedded"]
+        return cmd
 
     def analyse(self):
         url = self.url_var.get().strip()
@@ -202,13 +204,29 @@ class App(ctk.CTk):
         self.worker = threading.Thread(target=self._analyse_worker, args=(url,), daemon=True)
         self.worker.start()
 
+    def _extract_info_with_fallback(self, url, flat=True, first_only=False):
+        attempts = [False, True] if COOKIE_TXT.exists() or COOKIE_JSON.exists() else [False]
+        last_exc = None
+        for use_cookies in attempts:
+            try:
+                opts = {"quiet": True, "skip_download": True, "extract_flat": flat}
+                if first_only:
+                    opts["playlist_items"] = "1"
+                if use_cookies:
+                    if COOKIE_JSON.exists() and not COOKIE_TXT.exists():
+                        convert_json_to_netscape(COOKIE_JSON, COOKIE_TXT)
+                    if COOKIE_TXT.exists():
+                        opts["cookiefile"] = str(COOKIE_TXT)
+                    opts["extractor_args"] = {"youtube": {"player_client": ["default", "web_embedded"]}}
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception as exc:
+                last_exc = exc
+        raise last_exc
+
     def _analyse_worker(self, url):
         try:
-            opts = {"quiet": True, "skip_download": True, "extract_flat": "in_playlist"}
-            if COOKIE_TXT.exists():
-                opts["cookiefile"] = str(COOKIE_TXT)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            info = self._extract_info_with_fallback(url, flat="in_playlist")
             self.events.put(("analysed", info))
         except Exception as exc:
             self.events.put(("error", str(exc)))
@@ -217,26 +235,37 @@ class App(ctk.CTk):
         return info.get("_type") == "playlist" or bool(info.get("entries"))
 
     def _find_dutch_audio_format(self, video_url):
-        """Zelfde bewezen methode als het oude script: yt-dlp -F en zoek [nl] + audio only."""
-        cmd = [*self._ydl_base_cmd(), "-F", video_url]
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        attempts = [False, True] if COOKIE_TXT.exists() or COOKIE_JSON.exists() else [False]
+        diagnostics = []
 
-        candidates = []
-        for line in output.splitlines():
-            lower = line.lower()
-            is_audio = "audio only" in lower
-            is_dutch = bool(re.search(r"\[nl(?:[-_][a-z]+)?\]", line, re.IGNORECASE)) or "dutch" in lower or "nederlands" in lower
-            if is_audio and is_dutch:
-                match = re.match(r"\s*([^\s]+)", line)
-                if match:
-                    candidates.append((match.group(1), line.strip()))
+        for use_cookies in attempts:
+            cmd = [*self._base_cmd(use_cookies), "-F", video_url]
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            diagnostics.append(output)
 
-        if not candidates:
-            return None, output
+            candidates = []
+            for line in output.splitlines():
+                lower = line.lower()
+                is_audio = "audio only" in lower
+                is_dutch = (
+                    bool(re.search(r"\[nl(?:[-_][a-z]+)?\]", line, re.IGNORECASE))
+                    or "dutch" in lower
+                    or "nederlands" in lower
+                )
+                if is_audio and is_dutch:
+                    match = re.match(r"\s*([^\s]+)", line)
+                    if match:
+                        candidates.append((match.group(1), line.strip()))
 
-        # De eerste expliciete Nederlandse audio-only stream is exact hoe de oude versie werkte.
-        return candidates[0][0], candidates[0][1]
+            if candidates:
+                return candidates[0][0], candidates[0][1], use_cookies
+
+            # Als de pagina-reload fout optreedt, probeer automatisch de volgende methode.
+            if "page needs to be reloaded" in output.lower():
+                continue
+
+        return None, "\n\n".join(diagnostics), False
 
     def _height_filter(self):
         q = self.quality_var.get()
@@ -247,14 +276,7 @@ class App(ctk.CTk):
         return ""
 
     def _get_playlist_entries(self, url, first_only=False):
-        opts = {"quiet": True, "skip_download": True, "extract_flat": True}
-        if first_only:
-            opts["playlist_items"] = "1"
-        if COOKIE_TXT.exists():
-            opts["cookiefile"] = str(COOKIE_TXT)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
+        info = self._extract_info_with_fallback(url, flat=True, first_only=first_only)
         if info.get("entries"):
             entries = [e for e in info.get("entries", []) if e]
         else:
@@ -288,7 +310,6 @@ class App(ctk.CTk):
             _, entries = self._get_playlist_entries(url, first_only=test_first)
             if not entries:
                 raise RuntimeError("Geen video's gevonden.")
-
             if test_first:
                 entries = entries[:1]
 
@@ -314,16 +335,17 @@ class App(ctk.CTk):
                     continue
 
                 self.events.put(("checking", pos, total, title))
-                audio_format, diagnostic = self._find_dutch_audio_format(video_url)
+                audio_format, diagnostic, used_cookies = self._find_dutch_audio_format(video_url)
                 if not audio_format:
-                    preview = "\n".join([line for line in diagnostic.splitlines() if "audio only" in line.lower()][-10:])
+                    audio_lines = [line for line in diagnostic.splitlines() if "audio only" in line.lower()]
+                    preview = "\n".join(audio_lines[-12:])
                     raise RuntimeError(
                         f"Geen [nl] audio-only stream gevonden bij {pos:02d}. {title}.\n\n"
                         f"Laatste audioformats:\n{preview or 'Geen audioformatregels gevonden.'}"
                     )
 
                 self.events.put(("audio_found", pos, total, title, audio_format))
-                self._download_one(video_url, output_path, audio_format, pos, total, title)
+                self._download_one(video_url, output_path, audio_format, pos, total, title, used_cookies)
 
             self.events.put(("done", "Testvideo gedownload" if test_first else "Playlist voltooid"))
         except Exception as exc:
@@ -331,15 +353,13 @@ class App(ctk.CTk):
         finally:
             self.proc = None
 
-    def _download_one(self, video_url, output_path, audio_format, index, total, title):
+    def _download_one(self, video_url, output_path, audio_format, index, total, title, use_cookies=False):
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         selector = f"bv*{self._height_filter()}+{audio_format}"
         cmd = [
-            *self._ydl_base_cmd(),
+            *self._base_cmd(use_cookies),
             "--newline",
             "--no-part",
-            "--force-keyframes-at-cuts",
-            "--add-header", "User-Agent: Mozilla/5.0",
             "--fragment-retries", "15",
             "--retries", "10",
             "--sleep-interval", "2",
@@ -365,11 +385,13 @@ class App(ctk.CTk):
 
         last_pct = 0.0
         size = ""
+        tail = []
         for line in self.proc.stdout:
+            tail.append(line.rstrip())
+            tail = tail[-20:]
             if self.cancel_event.is_set():
                 self.proc.terminate()
                 raise RuntimeError("Download gestopt door gebruiker")
-
             pct_match = re.search(r"\[download\]\s+([0-9.]+)%", line)
             if pct_match:
                 last_pct = float(pct_match.group(1))
@@ -380,7 +402,7 @@ class App(ctk.CTk):
 
         rc = self.proc.wait()
         if rc != 0:
-            raise RuntimeError(f"yt-dlp stopte met foutcode {rc} bij {title}")
+            raise RuntimeError("yt-dlp stopte met foutcode %s bij %s\n\n%s" % (rc, title, "\n".join(tail[-8:])))
 
         final_size = self._human_size(output_path.stat().st_size) if output_path.exists() else size
         self.events.put(("progress", index, total, title, "finished", 100.0, final_size, f"NL · {audio_format}"))
@@ -420,7 +442,6 @@ class App(ctk.CTk):
 
                 if kind == "analysed":
                     info = event[1]
-                    self.playlist_info = info
                     if self._is_playlist(info):
                         count = len([e for e in info.get("entries", []) if e])
                         self.status_var.set(f"{info.get('title', 'Playlist')}  •  {count} video's")
